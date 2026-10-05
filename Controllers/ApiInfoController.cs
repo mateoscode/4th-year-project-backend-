@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
-using MySql.Data.MySqlClient;
+using MySqlConnector;
 using System.Data;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;

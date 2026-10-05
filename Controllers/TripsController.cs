@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
-using MySql.Data.MySqlClient;
+using MySqlConnector;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.ComponentModel.DataAnnotations;
@@ -12,6 +12,16 @@ namespace CSharpBackend.Controllers
     [EnableRateLimiting("sliding")]
     public class TripsController : ControllerBase
     {
+        private const string UsersTable = "userssl";
+        private const string ListingTable = "postedadd";
+
+        private static readonly HashSet<string> SupportedListingTypes = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "floor",
+            "couch",
+            "bed"
+        };
+
         private readonly IConfiguration _configuration;
         
         public TripsController(IConfiguration configuration)
@@ -21,45 +31,66 @@ namespace CSharpBackend.Controllers
 
         [HttpPost]
         [EnableRateLimiting("token")] 
-        public IActionResult SaveTrip([FromBody] TripDto dto)
+        public IActionResult SaveTrip([FromBody] CreateTripRequest dto)
         {
             if (!ModelState.IsValid)
                 return BadRequest(ModelState);
 
             try
             {
+                if (dto is null)
+                    return BadRequest(new { error = "Request body is required" });
+
                 dto.Name = dto.Name?.Trim();
-                
-                if (dto.UserId.HasValue && dto.UserId.Value <= 0)
+
+                if (dto.UserId <= 0)
                     return BadRequest(new { error = "Invalid user_id" });
+
+                if (string.IsNullOrWhiteSpace(dto.Name))
+                    return BadRequest(new { error = "name is required" });
+
+                var type = dto.Type?.Trim();
+                if (string.IsNullOrWhiteSpace(type) || !SupportedListingTypes.Contains(type))
+                    return BadRequest(new { error = "type must be one of: floor, couch, bed" });
+
+                if (dto.Price <= 0)
+                    return BadRequest(new { error = "price must be greater than 0" });
+
+                if (dto.Location is null)
+                    return BadRequest(new { error = "location is required" });
+
+                if (dto.Location.Lat < -90 || dto.Location.Lat > 90 || dto.Location.Lng < -180 || dto.Location.Lng > 180)
+                    return BadRequest(new { error = "location coordinates are out of range" });
+
+                var createdAt = dto.CreatedAt == default ? DateTime.UtcNow : dto.CreatedAt;
+                var mapData = string.IsNullOrWhiteSpace(dto.MapData) ? "{}" : dto.MapData;
 
                 using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
                 conn.Open();
                 
-                string mapDataJson = dto.MapData != null ? JsonSerializer.Serialize(dto.MapData) : "{}";
-                
                 using var cmd = new MySqlCommand(
-                    @"INSERT INTO trips (user_id, name, map_data, is_public, origin, destination, middleWaypoint, distanceKm) 
-                      VALUES (@user_id, @name, @map_data, @is_public, @origin, @destination, @middleWaypoint, @distanceKm)", 
+                    $@"INSERT INTO {ListingTable} (user_id, name, type, price, location_lat, location_lng, map_data, created_at)
+                      VALUES (@user_id, @name, @type, @price, @location_lat, @location_lng, @map_data, @created_at)",
                     conn);
-                cmd.Parameters.AddWithValue("@user_id", (object?)dto.UserId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("@name", dto.Name ?? string.Empty);
-                cmd.Parameters.AddWithValue("@map_data", mapDataJson);
-                cmd.Parameters.AddWithValue("@is_public", dto.IsPublic ?? true);
-                cmd.Parameters.AddWithValue("@origin", (object?)dto.Origin ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("@destination", (object?)dto.Destination ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("@middleWaypoint", (object?)dto.MiddleWaypoint ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("@distanceKm", (object?)dto.DistanceKm ?? DBNull.Value);
-                
+
+                cmd.Parameters.AddWithValue("@user_id", dto.UserId);
+                cmd.Parameters.AddWithValue("@name", dto.Name);
+                cmd.Parameters.AddWithValue("@type", type);
+                cmd.Parameters.AddWithValue("@price", dto.Price);
+                cmd.Parameters.AddWithValue("@location_lat", dto.Location.Lat);
+                cmd.Parameters.AddWithValue("@location_lng", dto.Location.Lng);
+                cmd.Parameters.AddWithValue("@map_data", mapData);
+                cmd.Parameters.AddWithValue("@created_at", createdAt);
+
                 cmd.ExecuteNonQuery();
                 long insertId = cmd.LastInsertedId;
-                
-                return StatusCode(201, new { id = insertId });
+
+                return StatusCode(201, new { id = insertId, message = "Listing saved successfully" });
             }
             catch (Exception ex)
             {
                 Console.WriteLine(ex);
-                return StatusCode(500, new { error = "Failed to save trip" });
+                return StatusCode(500, new { error = "Failed to save listing" });
             }
         }
 
@@ -67,52 +98,55 @@ namespace CSharpBackend.Controllers
         public IActionResult GetTrip(int id)
         {
             if (id <= 0)
-                return BadRequest(new { error = "Invalid trip ID" });
+                return BadRequest(new { error = "Invalid listing ID" });
 
             try
             {
                 using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
                 conn.Open();
-                
-                using var cmd = new MySqlCommand(@"
-                    SELECT t.*, u.username,
-                           (SELECT COUNT(*) FROM trip_interests WHERE trip_id = t.id) as interest_count
-                    FROM trips t 
-                    LEFT JOIN users u ON t.user_id = u.id 
-                    WHERE t.id = @id", conn);
+
+                using var cmd = new MySqlCommand($@"
+                    SELECT p.id,
+                           p.user_id,
+                           p.name,
+                           p.type,
+                           p.price,
+                           p.location_lat,
+                           p.location_lng,
+                           p.map_data,
+                           p.created_at,
+                           u.username,
+                           (SELECT COUNT(*) FROM trip_interests WHERE trip_id = p.id) as interest_count
+                    FROM {ListingTable} p
+                    LEFT JOIN {UsersTable} u ON p.user_id = u.id
+                    WHERE p.id = @id", conn);
                 cmd.Parameters.AddWithValue("@id", id);
-                
+
                 using var reader = cmd.ExecuteReader();
                 if (!reader.Read())
-                    return NotFound(new { error = "Trip not found" });
-                
-                var mapDataJson = reader.IsDBNull(reader.GetOrdinal("map_data")) 
-                    ? "{}" 
-                    : reader.GetString("map_data");
-                var mapData = JsonSerializer.Deserialize<JsonElement>(mapDataJson);
-                
-                var trip = new TripResponseDto
+                    return NotFound(new { error = "Listing not found" });
+
+                var result = new
                 {
-                    Id = reader.GetInt32("id"),
-                    UserId = reader.IsDBNull(reader.GetOrdinal("user_id")) ? null : reader.GetInt32("user_id"),
-                    Name = reader.GetString("name"),
-                    Origin = reader.IsDBNull(reader.GetOrdinal("origin")) ? null : reader.GetString("origin"),
-                    Destination = reader.IsDBNull(reader.GetOrdinal("destination")) ? null : reader.GetString("destination"),
-                    MiddleWaypoint = reader.IsDBNull(reader.GetOrdinal("middleWaypoint")) ? null : reader.GetString("middleWaypoint"),
-                    OwnerName = reader.IsDBNull(reader.GetOrdinal("username")) ? "Unknown" : reader.GetString("username"),
-                    DistanceKm = reader.IsDBNull(reader.GetOrdinal("distanceKm")) ? null : (double)reader.GetDecimal("distanceKm"),
-                    MapData = mapData,
-                    IsPublic = reader.IsDBNull(reader.GetOrdinal("is_public")) ? true : reader.GetBoolean("is_public"),
-                    DateIso = reader.GetDateTime("created_at"),
-                    InterestCount = reader.GetInt32("interest_count")
+                    id = reader.GetInt64("id"),
+                    user_id = reader.IsDBNull(reader.GetOrdinal("user_id")) ? (int?)null : reader.GetInt32("user_id"),
+                    name = reader.GetString("name"),
+                    type = reader.IsDBNull(reader.GetOrdinal("type")) ? null : reader.GetString("type"),
+                    price = reader.IsDBNull(reader.GetOrdinal("price")) ? (decimal?)null : reader.GetDecimal("price"),
+                    location_lat = reader.IsDBNull(reader.GetOrdinal("location_lat")) ? (double?)null : reader.GetDouble("location_lat"),
+                    location_lng = reader.IsDBNull(reader.GetOrdinal("location_lng")) ? (double?)null : reader.GetDouble("location_lng"),
+                    map_data = reader.IsDBNull(reader.GetOrdinal("map_data")) ? "{}" : reader.GetString("map_data"),
+                    created_at = reader.GetDateTime("created_at"),
+                    owner_name = reader.IsDBNull(reader.GetOrdinal("username")) ? "Unknown" : reader.GetString("username"),
+                    interest_count = reader.IsDBNull(reader.GetOrdinal("interest_count")) ? 0 : reader.GetInt32("interest_count")
                 };
-                
-                return Ok(trip);
+
+                return Ok(result);
             }
             catch (Exception ex)
             {
                 Console.WriteLine(ex);
-                return StatusCode(500, new { error = "Failed to load trip" });
+                return StatusCode(500, new { error = "Failed to load listing" });
             }
         }
 
@@ -121,50 +155,52 @@ namespace CSharpBackend.Controllers
         {
             try
             {
-                var trips = new List<TripResponseDto>();
-                
+                var listings = new List<object>();
+
                 using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
                 conn.Open();
-                
-                using var cmd = new MySqlCommand(@"
-                    SELECT t.*, u.username,
-                           (SELECT COUNT(*) FROM trip_interests WHERE trip_id = t.id) as interest_count
-                    FROM trips t 
-                    LEFT JOIN users u ON t.user_id = u.id 
-                    WHERE t.is_public = 1 OR t.is_public IS NULL
-                    ORDER BY t.created_at DESC", conn);
+
+                using var cmd = new MySqlCommand($@"
+                    SELECT p.id,
+                           p.user_id,
+                           p.name,
+                           p.type,
+                           p.price,
+                           p.location_lat,
+                           p.location_lng,
+                           p.map_data,
+                           p.created_at,
+                           u.username,
+                           (SELECT COUNT(*) FROM trip_interests WHERE trip_id = p.id) as interest_count
+                    FROM {ListingTable} p
+                    LEFT JOIN {UsersTable} u ON p.user_id = u.id
+                    ORDER BY p.created_at DESC", conn);
+
                 using var reader = cmd.ExecuteReader();
-                
                 while (reader.Read())
                 {
-                    var mapDataJson = reader.IsDBNull(reader.GetOrdinal("map_data")) 
-                        ? "{}" 
-                        : reader.GetString("map_data");
-                    var mapData = JsonSerializer.Deserialize<JsonElement>(mapDataJson);
-                    
-                    trips.Add(new TripResponseDto
+                    listings.Add(new
                     {
-                        Id = reader.GetInt32("id"),
-                        UserId = reader.IsDBNull(reader.GetOrdinal("user_id")) ? null : reader.GetInt32("user_id"),
-                        Name = reader.GetString("name"),
-                        Origin = reader.IsDBNull(reader.GetOrdinal("origin")) ? null : reader.GetString("origin"),
-                        Destination = reader.IsDBNull(reader.GetOrdinal("destination")) ? null : reader.GetString("destination"),
-                        MiddleWaypoint = reader.IsDBNull(reader.GetOrdinal("middleWaypoint")) ? null : reader.GetString("middleWaypoint"),
-                        OwnerName = reader.IsDBNull(reader.GetOrdinal("username")) ? "Unknown" : reader.GetString("username"),
-                        DistanceKm = reader.IsDBNull(reader.GetOrdinal("distanceKm")) ? null : (double)reader.GetDecimal("distanceKm"),
-                        MapData = mapData,
-                        IsPublic = reader.IsDBNull(reader.GetOrdinal("is_public")) ? true : reader.GetBoolean("is_public"),
-                        DateIso = reader.GetDateTime("created_at"),
-                        InterestCount = reader.GetInt32("interest_count")
+                        id = reader.GetInt64("id"),
+                        user_id = reader.IsDBNull(reader.GetOrdinal("user_id")) ? (int?)null : reader.GetInt32("user_id"),
+                        name = reader.GetString("name"),
+                        type = reader.IsDBNull(reader.GetOrdinal("type")) ? null : reader.GetString("type"),
+                        price = reader.IsDBNull(reader.GetOrdinal("price")) ? (decimal?)null : reader.GetDecimal("price"),
+                        location_lat = reader.IsDBNull(reader.GetOrdinal("location_lat")) ? (double?)null : reader.GetDouble("location_lat"),
+                        location_lng = reader.IsDBNull(reader.GetOrdinal("location_lng")) ? (double?)null : reader.GetDouble("location_lng"),
+                        map_data = reader.IsDBNull(reader.GetOrdinal("map_data")) ? "{}" : reader.GetString("map_data"),
+                        created_at = reader.GetDateTime("created_at"),
+                        owner_name = reader.IsDBNull(reader.GetOrdinal("username")) ? "Unknown" : reader.GetString("username"),
+                        interest_count = reader.IsDBNull(reader.GetOrdinal("interest_count")) ? 0 : reader.GetInt32("interest_count")
                     });
                 }
-                
-                return Ok(trips);
+
+                return Ok(listings);
             }
             catch (Exception ex)
             {
                 Console.WriteLine(ex);
-                return StatusCode(500, new { error = "Failed to list trips" });
+                return StatusCode(500, new { error = "Failed to list listings" });
             }
         }
 
@@ -176,117 +212,91 @@ namespace CSharpBackend.Controllers
 
             try
             {
-                var trips = new List<TripResponseDto>();
-                
+                var listings = new List<object>();
+
                 using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
                 conn.Open();
-                
-                using var cmd = new MySqlCommand(@"
-                    SELECT t.*, u.username,
-                           (SELECT COUNT(*) FROM trip_interests WHERE trip_id = t.id) as interest_count
-                    FROM trips t 
-                    LEFT JOIN users u ON t.user_id = u.id 
-                    WHERE t.user_id = @user_id 
-                    ORDER BY t.created_at DESC", conn);
+
+                using var cmd = new MySqlCommand($@"
+                    SELECT p.id,
+                           p.user_id,
+                           p.name,
+                           p.type,
+                           p.price,
+                           p.location_lat,
+                           p.location_lng,
+                           p.map_data,
+                           p.created_at,
+                           u.username,
+                           (SELECT COUNT(*) FROM trip_interests WHERE trip_id = p.id) as interest_count
+                    FROM {ListingTable} p
+                    LEFT JOIN {UsersTable} u ON p.user_id = u.id
+                    WHERE p.user_id = @user_id
+                    ORDER BY p.created_at DESC", conn);
                 cmd.Parameters.AddWithValue("@user_id", userId);
+
                 using var reader = cmd.ExecuteReader();
-                
                 while (reader.Read())
                 {
-                    var mapDataJson = reader.IsDBNull(reader.GetOrdinal("map_data")) 
-                        ? "{}" 
-                        : reader.GetString("map_data");
-                    var mapData = JsonSerializer.Deserialize<JsonElement>(mapDataJson);
-                    
-                    trips.Add(new TripResponseDto
+                    listings.Add(new
                     {
-                        Id = reader.GetInt32("id"),
-                        UserId = reader.IsDBNull(reader.GetOrdinal("user_id")) ? null : reader.GetInt32("user_id"),
-                        Name = reader.GetString("name"),
-                        Origin = reader.IsDBNull(reader.GetOrdinal("origin")) ? null : reader.GetString("origin"),
-                        Destination = reader.IsDBNull(reader.GetOrdinal("destination")) ? null : reader.GetString("destination"),
-                        MiddleWaypoint = reader.IsDBNull(reader.GetOrdinal("middleWaypoint")) ? null : reader.GetString("middleWaypoint"),
-                        OwnerName = reader.IsDBNull(reader.GetOrdinal("username")) ? "Unknown" : reader.GetString("username"),
-                        DistanceKm = reader.IsDBNull(reader.GetOrdinal("distanceKm")) ? null : (double)reader.GetDecimal("distanceKm"),
-                        MapData = mapData,
-                        IsPublic = reader.IsDBNull(reader.GetOrdinal("is_public")) ? true : reader.GetBoolean("is_public"),
-                        DateIso = reader.GetDateTime("created_at"),
-                        InterestCount = reader.GetInt32("interest_count")
+                        id = reader.GetInt64("id"),
+                        user_id = reader.IsDBNull(reader.GetOrdinal("user_id")) ? (int?)null : reader.GetInt32("user_id"),
+                        name = reader.GetString("name"),
+                        type = reader.IsDBNull(reader.GetOrdinal("type")) ? null : reader.GetString("type"),
+                        price = reader.IsDBNull(reader.GetOrdinal("price")) ? (decimal?)null : reader.GetDecimal("price"),
+                        location_lat = reader.IsDBNull(reader.GetOrdinal("location_lat")) ? (double?)null : reader.GetDouble("location_lat"),
+                        location_lng = reader.IsDBNull(reader.GetOrdinal("location_lng")) ? (double?)null : reader.GetDouble("location_lng"),
+                        map_data = reader.IsDBNull(reader.GetOrdinal("map_data")) ? "{}" : reader.GetString("map_data"),
+                        created_at = reader.GetDateTime("created_at"),
+                        owner_name = reader.IsDBNull(reader.GetOrdinal("username")) ? "Unknown" : reader.GetString("username"),
+                        interest_count = reader.IsDBNull(reader.GetOrdinal("interest_count")) ? 0 : reader.GetInt32("interest_count")
                     });
                 }
-                
-                return Ok(trips);
+
+                return Ok(listings);
             }
             catch (Exception ex)
             {
                 Console.WriteLine(ex);
-                return StatusCode(500, new { error = "Failed to load user trips" });
+                return StatusCode(500, new { error = "Failed to load user listings" });
             }
         }
 
         [HttpPatch("{tripId}/privacy")]
         public IActionResult UpdateTripPrivacy(int tripId, [FromBody] UpdatePrivacyDto dto)
         {
-            if (tripId <= 0)
-                return BadRequest(new { error = "Invalid trip ID" });
-
-            if (!ModelState.IsValid)
-                return BadRequest(ModelState);
-
-            try
-            {
-                using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
-                conn.Open();
-                
-                using var checkCmd = new MySqlCommand("SELECT id FROM trips WHERE id = @id", conn);
-                checkCmd.Parameters.AddWithValue("@id", tripId);
-                var exists = checkCmd.ExecuteScalar();
-                
-                if (exists == null)
-                    return NotFound(new { error = "Trip not found" });
-                
-                using var cmd = new MySqlCommand("UPDATE trips SET is_public = @is_public WHERE id = @id", conn);
-                cmd.Parameters.AddWithValue("@is_public", dto.IsPublic);
-                cmd.Parameters.AddWithValue("@id", tripId);
-                cmd.ExecuteNonQuery();
-                
-                return Ok(new { message = "Privacy setting updated successfully", isPublic = dto.IsPublic });
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine(ex);
-                return StatusCode(500, new { error = "Failed to update privacy setting" });
-            }
+            return StatusCode(StatusCodes.Status501NotImplemented, new { error = "Listing privacy is not supported on the current postedadd schema." });
         }
 
         [HttpDelete("{id}")]
         public IActionResult DeleteTrip(int id)
         {
             if (id <= 0)
-                return BadRequest(new { error = "Invalid trip ID" });
+                return BadRequest(new { error = "Invalid listing ID" });
 
             try
             {
                 using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
                 conn.Open();
-                
-                using var checkCmd = new MySqlCommand("SELECT id FROM trips WHERE id = @id", conn);
+
+                using var checkCmd = new MySqlCommand($"SELECT id FROM {ListingTable} WHERE id = @id", conn);
                 checkCmd.Parameters.AddWithValue("@id", id);
                 var exists = checkCmd.ExecuteScalar();
-                
+
                 if (exists == null)
-                    return NotFound(new { error = "Trip not found" });
-                
-                using var cmd = new MySqlCommand("DELETE FROM trips WHERE id = @id", conn);
+                    return NotFound(new { error = "Listing not found" });
+
+                using var cmd = new MySqlCommand($"DELETE FROM {ListingTable} WHERE id = @id", conn);
                 cmd.Parameters.AddWithValue("@id", id);
                 cmd.ExecuteNonQuery();
-                
-                return Ok(new { message = "Trip deleted successfully" });
+
+                return Ok(new { message = "Listing deleted successfully" });
             }
             catch (Exception ex)
             {
                 Console.WriteLine(ex);
-                return StatusCode(500, new { error = "Failed to delete trip" });
+                return StatusCode(500, new { error = "Failed to delete listing" });
             }
         }
 
@@ -304,16 +314,16 @@ namespace CSharpBackend.Controllers
                 using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
                 conn.Open();
                 
-                // Check if trip exists
-                using var checkTripCmd = new MySqlCommand("SELECT id FROM trips WHERE id = @id", conn);
+                // Check if listing exists
+                using var checkTripCmd = new MySqlCommand($"SELECT id FROM {ListingTable} WHERE id = @id", conn);
                 checkTripCmd.Parameters.AddWithValue("@id", tripId);
                 var tripExists = checkTripCmd.ExecuteScalar();
                 
                 if (tripExists == null)
-                    return NotFound(new { message = "Trip not found" });
+                    return NotFound(new { message = "Listing not found" });
                 
                 // Check if user exists
-                using var checkUserCmd = new MySqlCommand("SELECT id FROM users WHERE id = @id", conn);
+                using var checkUserCmd = new MySqlCommand($"SELECT id FROM {UsersTable} WHERE id = @id", conn);
                 checkUserCmd.Parameters.AddWithValue("@id", request.UserId);
                 var userExists = checkUserCmd.ExecuteScalar();
                 
@@ -352,7 +362,7 @@ namespace CSharpBackend.Controllers
                 using var cmd = new MySqlCommand(@"
                     SELECT u.id, u.username, u.email, ti.created_at
                     FROM trip_interests ti
-                    JOIN users u ON ti.user_id = u.id
+                    JOIN userssl u ON ti.user_id = u.id
                     WHERE ti.trip_id = @tripId
                     ORDER BY ti.created_at DESC", conn);
                 cmd.Parameters.AddWithValue("@tripId", tripId);
@@ -437,35 +447,43 @@ namespace CSharpBackend.Controllers
         }
     }
 
-    public class TripDto
+    public class CreateTripRequest
     {
         [JsonPropertyName("user_id")]
-        [Range(1, int.MaxValue, ErrorMessage = "User ID must be a positive number")]
-        public int? UserId { get; set; }
-        
+        [Required(ErrorMessage = "user_id is required")]
+        [Range(1, int.MaxValue, ErrorMessage = "user_id must be a positive number")]
+        public int UserId { get; set; }
+
         [JsonPropertyName("name")]
-        [Required(ErrorMessage = "Trip name is required")]
-        [StringLength(200, MinimumLength = 1, ErrorMessage = "Trip name must be between 1 and 200 characters")]
-        [RegularExpression(@"^[a-zA-Z0-9\s\-_.,!?()]+$", ErrorMessage = "Trip name contains invalid characters")]
-        public string? Name { get; set; }
-        
+        [Required(ErrorMessage = "name is required")]
+        [StringLength(200, MinimumLength = 1, ErrorMessage = "name must be between 1 and 200 characters")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonPropertyName("type")]
+        [Required(ErrorMessage = "type is required")]
+        public string Type { get; set; } = "floor";
+
+        [JsonPropertyName("price")]
+        [Required(ErrorMessage = "price is required")]
+        public decimal Price { get; set; }
+
+        [JsonPropertyName("location")]
+        public LocationPoint Location { get; set; } = new();
+
         [JsonPropertyName("map_data")]
-        public object? MapData { get; set; }
-        
-        [JsonPropertyName("isPublic")]
-        public bool? IsPublic { get; set; }
-        
-        [JsonPropertyName("origin")]
-        public string? Origin { get; set; }
-        
-        [JsonPropertyName("destination")]
-        public string? Destination { get; set; }
-        
-        [JsonPropertyName("middleWaypoint")]
-        public string? MiddleWaypoint { get; set; }
-        
-        [JsonPropertyName("distanceKm")]
-        public double? DistanceKm { get; set; }
+        public string MapData { get; set; } = string.Empty;
+
+        [JsonPropertyName("created_at")]
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    }
+
+    public class LocationPoint
+    {
+        [JsonPropertyName("lat")]
+        public double Lat { get; set; }
+
+        [JsonPropertyName("lng")]
+        public double Lng { get; set; }
     }
 
     public class TripResponseDto

@@ -1,7 +1,49 @@
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Mvc;
+using MySqlConnector;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+if (!string.IsNullOrWhiteSpace(connectionString))
+{
+    using var conn = new MySqlConnection(connectionString);
+    conn.Open();
+
+    using (var cmd = new MySqlCommand(@"
+        CREATE TABLE IF NOT EXISTS postedadd (
+            id BIGINT NOT NULL AUTO_INCREMENT,
+            user_id INT NOT NULL,
+            name VARCHAR(200) NOT NULL,
+            type VARCHAR(20) NOT NULL,
+            price DECIMAL(10,2) NOT NULL,
+            location_lat DOUBLE NOT NULL,
+            location_lng DOUBLE NOT NULL,
+            map_data TEXT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_user_id (user_id),
+            KEY idx_created_at (created_at)
+        )", conn))
+    {
+        cmd.ExecuteNonQuery();
+    }
+
+    using (var cmd = new MySqlCommand(@"
+        CREATE TABLE IF NOT EXISTS trip_interests (
+            id BIGINT NOT NULL AUTO_INCREMENT,
+            trip_id BIGINT NOT NULL,
+            user_id INT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_trip_user (trip_id, user_id),
+            KEY idx_trip_id (trip_id),
+            KEY idx_user_id (user_id)
+        )", conn))
+    {
+        cmd.ExecuteNonQuery();
+    }
+}
 
 builder.Services.AddControllers();
 

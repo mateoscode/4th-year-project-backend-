@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
-using MySql.Data.MySqlClient;
+using MySqlConnector;
 using System.Data;
 using System.ComponentModel.DataAnnotations;
 
@@ -11,6 +11,7 @@ namespace CSharpBackend.Controllers
     [EnableRateLimiting("sliding")]
     public class UserController : ControllerBase
     {
+        private const string UsersTable = "userssl";
         private readonly IConfiguration _configuration;
         public UserController(IConfiguration configuration)
         {
@@ -31,14 +32,14 @@ namespace CSharpBackend.Controllers
 
             using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
             conn.Open();
-            using var checkCmd = new MySqlCommand("SELECT id FROM users WHERE email = @email", conn);
+            using var checkCmd = new MySqlCommand($"SELECT id FROM {UsersTable} WHERE email = @email", conn);
             checkCmd.Parameters.AddWithValue("@email", dto.Email);
             using var reader = checkCmd.ExecuteReader();
             if (reader.HasRows)
                 return Conflict(new { message = "Email already registered" });
             reader.Close();
 
-            using var cmd = new MySqlCommand("INSERT INTO users (username, email, password) VALUES (@username, @email, @password)", conn);
+            using var cmd = new MySqlCommand($"INSERT INTO {UsersTable} (username, email, password) VALUES (@username, @email, @password)", conn);
             cmd.Parameters.AddWithValue("@username", dto.Username);
             cmd.Parameters.AddWithValue("@email", dto.Email);
             cmd.Parameters.AddWithValue("@password", dto.Password);
@@ -66,7 +67,7 @@ namespace CSharpBackend.Controllers
 
             using var conn = new MySqlConnection(_configuration.GetConnectionString("DefaultConnection"));
             conn.Open();
-            using var cmd = new MySqlCommand("SELECT id, username, email FROM users WHERE email = @email AND password = @password", conn);
+            using var cmd = new MySqlCommand($"SELECT id, username, email FROM {UsersTable} WHERE email = @email AND password = @password", conn);
             cmd.Parameters.AddWithValue("@email", dto.Email);
             cmd.Parameters.AddWithValue("@password", dto.Password);
             using var reader = cmd.ExecuteReader();
@@ -88,7 +89,7 @@ namespace CSharpBackend.Controllers
                 conn.Open();
                 
                 // Check if user exists
-                using var checkCmd = new MySqlCommand("SELECT id FROM users WHERE id = @id", conn);
+                using var checkCmd = new MySqlCommand($"SELECT id FROM {UsersTable} WHERE id = @id", conn);
                 checkCmd.Parameters.AddWithValue("@id", userId);
                 var exists = checkCmd.ExecuteScalar();
                 
@@ -96,7 +97,7 @@ namespace CSharpBackend.Controllers
                     return NotFound(new { error = "User not found" });
                 
                 // Delete user (cascade delete will remove trips and trip_interests)
-                using var cmd = new MySqlCommand("DELETE FROM users WHERE id = @id", conn);
+                using var cmd = new MySqlCommand($"DELETE FROM {UsersTable} WHERE id = @id", conn);
                 cmd.Parameters.AddWithValue("@id", userId);
                 cmd.ExecuteNonQuery();
                 
